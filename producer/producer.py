@@ -1,10 +1,28 @@
 """
 Продюсер сообщений в Kafka-топик (модель push).
-Гарантия доставки: At Least Once.
+
+Гарантия доставки: At Least Once ("как минимум один раз").
+Это достигается комбинацией:
+  - acks='all'            -> продюсер ждёт подтверждения от ВСЕХ ISR-реплик
+                              брокера, прежде чем считать сообщение отправленным.
+                              Это защищает от потери сообщения при падении лидера
+                              партиции сразу после записи.
+  - retries               -> при временной ошибке (например, недоступность
+                              брокера) продюсер повторит отправку сам, а не
+                              просто уронит сообщение.
+  - enable.idempotence не включён (по умолчанию False) -> именно поэтому
+                              гарантия остаётся "At Least Once", а не
+                              "Exactly Once": при повторной отправке после
+                              таймаута подтверждения теоретически возможна
+                              дублирующая запись, но не потеря сообщения.
+
+Хотя send()/produce() в Kafka асинхронны, работа с сокетом брокера — это
+классический io-поток, поэтому в конце жизни продюсера обязательно
+закрываем его (flush()/close() по аналогии с close() у файлов/сокетов),
+чтобы не потерять сообщения, которые ещё лежат в буфере на отправку.
 """
 
 import json
-import logging
 import os
 import sys
 import time
@@ -13,12 +31,9 @@ from confluent_kafka import Producer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from common.message import Message  # noqa: E402
+from common.kafka_utils import configure_logging  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("producer")
+logger = configure_logging("producer")
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "my-topic")
@@ -48,6 +63,48 @@ def delivery_report(err, msg):
         )
 
 
+def send_with_retry(producer: Producer, message: Message, payload: bytes) -> None:
+    """
+    Отправляет ОДНО И ТО ЖЕ уже сериализованное сообщение, повторяя попытку
+    при BufferError (локальная очередь librdkafka переполнена), пока
+    сообщение не будет поставлено в очередь на отправку.
+
+    Это дополняет server-side retries (настройка `retries` в PRODUCER_CONFIG,
+    которая покрывает сетевые ошибки/недоступность брокера) client-side
+    повтором именно для случая переполнения локального буфера — без этого
+    `continue` в вызывающем цикле привёл бы к потере сообщения и нарушению
+    гарантии At Least Once.
+    """
+    while True:
+        try:
+            # produce() асинхронен: сообщение кладётся в очередь,
+            # а delivery_report вызовется позже, когда poll()/flush()
+            # обработает события librdkafka.
+            producer.produce(
+                topic=TOPIC,
+                key=str(message.message_id).encode("utf-8"),
+                value=payload,
+                callback=delivery_report,
+            )
+            return
+        except BufferError:
+            logger.warning(
+                "Локальная очередь продюсера переполнена, ждём и повторяем "
+                "отправку сообщения #%s (сообщение не отбрасывается)...",
+                message.sequence,
+            )
+            # poll() освобождает место в очереди, обрабатывая уже
+            # подтверждённые брокером callback'и, после чего повторяем
+            # попытку отправить ТО ЖЕ САМОЕ сообщение.
+            producer.poll(1)
+        except Exception:
+            logger.exception(
+                "Непредвиденная ошибка при отправке сообщения #%s, повторяем попытку...",
+                message.sequence,
+            )
+            time.sleep(0.5)
+
+
 def run():
     producer = Producer(PRODUCER_CONFIG)
     sequence = 0
@@ -70,23 +127,13 @@ def run():
 
             print(f"[PRODUCER] Отправка: {payload.decode('utf-8')}")
 
-            try:
-                # produce() асинхронен: сообщение кладётся в очередь,
-                # а doclivery_report вызовется позже, когда poll()/flush()
-                # обработает события librdkafka.
-                producer.produce(
-                    topic=TOPIC,
-                    key=str(message.message_id).encode("utf-8"),
-                    value=payload,
-                    callback=delivery_report,
-                )
-            except BufferError:
-                logger.warning("Локальная очередь продюсера переполнена, ждём и повторяем...")
-                producer.poll(1)
-                continue
-            except Exception:
-                logger.exception("Непредвиденная ошибка при отправке сообщения #%s", sequence)
-                continue
+            # send_with_retry гарантирует, что ИМЕННО ЭТО сообщение будет
+            # поставлено в очередь на отправку, прежде чем мы перейдём к
+            # следующему. Если бы при BufferError мы просто делали `continue`,
+            # sequence всё равно увеличился бы на следующей итерации, и это
+            # сообщение оказалось бы потеряно — что противоречило бы
+            # заявленной гарантии At Least Once.
+            send_with_retry(producer, message, payload)
 
             # poll(0) обрабатывает накопившиеся callback'и доставки без блокировки
             producer.poll(0)
