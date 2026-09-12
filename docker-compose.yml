@@ -1,0 +1,105 @@
+services:
+  kafka1:
+    image: bitnami/kafka:3.7
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka1:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9093,2@kafka2:9093"
+      KAFKA_KRAFT_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "2"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "2"
+      KAFKA_CFG_MIN_INSYNC_REPLICAS: "1"
+    volumes:
+      - kafka1-data:/bitnami/kafka
+    networks:
+      - kafka-net
+
+  kafka2:
+    image: bitnami/kafka:3.7
+    container_name: kafka2
+    ports:
+      - "9094:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: "2"
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka2:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9093,2@kafka2:9093"
+      KAFKA_KRAFT_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "2"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "2"
+      KAFKA_CFG_MIN_INSYNC_REPLICAS: "1"
+    volumes:
+      - kafka2-data:/bitnami/kafka
+    networks:
+      - kafka-net
+
+  # Топик создаётся вручную консольной командой (см. topic.txt), поэтому
+  # отдельного init-контейнера для автосоздания топика в compose нет.
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    container_name: producer
+    depends_on:
+      - kafka1
+      - kafka2
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092"
+      KAFKA_TOPIC: "my-topic"
+      SEND_INTERVAL_SECONDS: "1"
+    networks:
+      - kafka-net
+
+  consumer-single:
+    build:
+      context: .
+      dockerfile: consumer_single/Dockerfile
+    depends_on:
+      - kafka1
+      - kafka2
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092"
+      KAFKA_TOPIC: "my-topic"
+    deploy:
+      replicas: 2
+    networks:
+      - kafka-net
+
+  consumer-batch:
+    build:
+      context: .
+      dockerfile: consumer_batch/Dockerfile
+    depends_on:
+      - kafka1
+      - kafka2
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092"
+      KAFKA_TOPIC: "my-topic"
+      BATCH_SIZE: "10"
+    deploy:
+      replicas: 2
+    networks:
+      - kafka-net
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  kafka1-data:
+  kafka2-data:
