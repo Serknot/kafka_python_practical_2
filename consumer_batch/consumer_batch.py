@@ -1,24 +1,20 @@
 """
 BatchMessageConsumer — читает МИНИМУМ по 10 сообщений за один poll/consume,
-обрабатывает их в цикле и коммитит оффсет один раз после обработки всей пачки
+обрабатывает их в цикле и коммитит оффсет ОДИН РАЗ после обработки всей пачки
 (ручной коммит, enable.auto.commit=False).
 
 """
 
-import logging
 import os
 import sys
 
-from confluent_kafka import Consumer, KafkaException, KafkaError
+from confluent_kafka import Consumer, KafkaException
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from common.message import Message  # noqa: E402
+from common.kafka_utils import configure_logging, is_partition_eof  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("batch_consumer")
+logger = configure_logging("batch_consumer")
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "my-topic")
@@ -57,20 +53,25 @@ def run():
 
             logger.info("Получена пачка из %s сообщений", len(batch))
 
-            processed_any = False
+            has_records = False
+
             for msg in batch:
                 if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                    if is_partition_eof(msg.error()):
                         continue
                     logger.error("Ошибка консьюмера: %s", msg.error())
                     continue
+
+                has_records = True
 
                 try:
                     message = Message.deserialize(msg.value())
                 except Exception as exc:
                     print(f"[ОШИБКА ДЕСЕРИАЛИЗАЦИИ] {exc}")
                     logger.exception(
-                        "Не удалось десериализовать сообщение offset=%s", msg.offset()
+                        "Не удалось десериализовать сообщение offset=%s "
+                        "(будет пропущено, оффсет всё равно продвинется)",
+                        msg.offset(),
                     )
                     continue
 
@@ -81,17 +82,22 @@ def run():
 
                 try:
                     process_message(message)
-                    processed_any = True
                 except Exception:
                     logger.exception(
-                        "Ошибка обработки сообщения offset=%s, продолжаем пачку", msg.offset()
+                        "Ошибка обработки сообщения offset=%s (сообщение считается "
+                        "обработанным — залогировано, оффсет продвинется), "
+                        "продолжаем пачку",
+                        msg.offset(),
                     )
 
-            if processed_any:
+            if has_records:
                 try:
-                    # Один синхронный коммит на всю пачку сразу после обработки.
+                    # Один синхронный коммит на всю пачку сразу после обработки
+                    # (в том числе после обработки битых сообщений — см. комментарий выше).
                     consumer.commit(asynchronous=False)
-                    logger.info("Оффсет закоммичен после обработки пачки из %s сообщений", len(batch))
+                    logger.info(
+                        "Оффсет закоммичен после обработки пачки из %s сообщений", len(batch)
+                    )
                 except KafkaException:
                     logger.exception("Не удалось закоммитить оффсет после пачки")
 
